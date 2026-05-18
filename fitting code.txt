@@ -1,0 +1,211 @@
+# pinn_dengue_with_plots.py
+# Full PINN training starter with plots (PyTorch)
+# Trains PINN with fixed eta, produces training & diagnostics plots.
+
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from matplotlib import rcParams
+from matplotlib.gridspec import GridSpec
+from scipy.stats import t # Added for confidence interval t-value
+import pandas as pd # Added for reading CSV data
+
+# --------------------
+# Styling & device
+# --------------------
+rcParams['mathtext.fontset'] = 'stix'
+rcParams['font.family'] = 'DejaVu Sans'
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dtype = torch.float32
+
+# --------------------
+# Simple RK4 integrator (numpy) for "ground truth" simulation
+# --------------------
+def rk4_step(f, x, t, dt, params):
+    k1 = f(x, t, params)
+    k2 = f(x + 0.5*dt*k1, t + 0.5*dt, params)
+    k3 = f(x + 0.5*dt*k2, t + 0.5*dt, params)
+    k4 = f(x + dt*k3, t + dt, params)
+    return x + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+
+def integrate(f, x0, t_span, params):
+    xs = [x0.copy()]
+    for i in range(len(t_span)-1):
+        dt = t_span[i+1] - t_span[i]
+        x_new = rk4_step(f, xs[-1], t_span[i], dt, params)
+        xs.append(x_new.copy())
+    return np.stack(xs, axis=0)
+
+# --------------------
+# Mechanistic RHS (numpy & torch)
+# --------------------
+def f_mech_np(X, t, p):
+    S, I, R, Sv, Iv = X
+    N = p['N']; Nv = p['N_v']
+    pi = p['pi']; alpha = p['alpha']; alpha1 = p['alpha1']
+    beta1 = p['beta1']; beta2 = p['beta2']
+    psi0 = p['psi0']; psi1 = p['psi1']; r_val = p['r_val'] # New psi parameters
+    xi = p['xi']; omega = p['omega']; a = p['a']; u = p['u']; k = p['k']; eta_v = p['eta']
+
+    # Calculate psi dynamically: psi(r, I) = psi_0 + (psi_1 - psi_0) * r / (r + I)
+    I_safe = np.maximum(I, 1e-9) # Small epsilon to prevent division by zero if I is exactly 0
+    current_psi = psi0 + (psi1 - psi0) * r_val / (r_val + I_safe)
+
+    dS = pi - beta1 * (S * Iv) / N - alpha * S
+    dI = beta1 * (S * Iv) / N - (alpha1 + alpha + current_psi) * I # Use current_psi
+    dR = current_psi * I - alpha * R # Use current_psi
+    dSv = eta_v - beta2 * (Sv * I) / N - xi * Sv - omega * a * Nv
+    dIv = beta2 * (Sv * I) / N - (xi + u + (1 - omega) * a * Nv / k) * Iv
+    return np.array([dS, dI, dR, dSv, dIv], dtype=float)
+
+def f_mech_torch(X, eta):
+    S = X[:, 0:1]; I = X[:, 1:2]; R = X[:, 2:3]; Sv = X[:, 3:4]; Iv = X[:, 4:5]
+    N = eta['N']; Nv = eta['N_v']
+    pi = eta['pi']; alpha = eta['alpha']; alpha1 = eta['alpha1']
+    beta1 = eta['beta1']; beta2 = eta['beta2']
+    psi0 = eta['psi0']; psi1 = eta['psi1']; r_val = eta['r_val'] # New psi parameters
+    xi = eta['xi']; omega = eta['omega']; a = eta['a']; u = eta['u']; k = eta['k']; eta_v = eta['eta']
+
+    # Calculate psi dynamically: psi(r, I) = psi_0 + (psi_1 - psi_0) * r / (r + I)
+    I_safe = torch.maximum(I, torch.tensor(1e-9, dtype=dtype, device=device)) # Prevent division by zero
+    current_psi = psi0 + (psi1 - psi0) * r_val / (r_val + I_safe)
+
+    dS = pi - beta1 * (S * Iv) / N - alpha * S
+    dI = beta1 * (S * Iv) / N - (alpha1 + alpha + current_psi) * I # Use current_psi
+    dR = current_psi * I - alpha * R # Use current_psi
+    dSv = eta_v - beta2 * (Sv * I) / N - xi * Sv - omega * a * Nv
+    dIv = beta2 * (Sv * I) / N - (xi + u + (1 - omega) * a * Nv / k) * Iv
+    return torch.cat([dS, dI, dR, dSv, dIv], dim=1)
+
+# --------------------
+# "True" parameters for simulation
+# --------------------
+eta_true = {
+    'N': 1.0, 'N_v': 1.0,
+    'pi': 0.01, 'alpha': 1e-3, 'alpha1': 1e-3,
+    'beta1': 0.9, 'beta2': 0.6,
+    'psi0': 0.1, 'psi1': 0.3, 'r_val': 115.0, # New psi parameters
+    'xi': 0.01, 'omega': 0.1, 'a': 0.1, 'u': 0.01, 'k': 100.0, 'eta': 0.02
+}
+# Prior (fixed) used by PINN - intentionally slightly different to show residuals
+eta_pin = eta_true.copy()
+eta_pin['beta1'] = 0.8
+eta_pin['beta2'] = 0.55
+eta_pin['psi0'] = 0.08 # Slightly different for PINN prior
+eta_pin['psi1'] = 0.25 # Slightly different for PINN prior
+# r_val stays the same as it's a fixed characteristic, not a fitted parameter to be perturbed
+
+# --------------------
+# Load real data from brazil0.csv
+# --------------------
+print("Loading data from brazil0.csv...")
+df_brazil = pd.read_csv('brazil0.csv')
+t_data_raw = df_brazil['Time'].values
+I_obs_raw = df_brazil['Cases'].values
+
+# Normalize observed cases: Divide by the maximum number of cases to keep it proportional to N=1
+# This is a heuristic. A more rigorous approach might use a known total population.
+max_cases_val = I_obs_raw.max()
+if max_cases_val > 1.0:
+    I_obs = I_obs_raw / max_cases_val
+    print(f"Note: Observed cases normalized by max value ({max_cases_val:.2f}) to fit [0,1] scale.")
+else:
+    I_obs = I_obs_raw
+    print("Note: Observed cases assumed to be already normalized or within [0,1] scale.")
+
+t_data = t_data_raw
+
+# Determine t0 and tEnd from the loaded data
+t0, tEnd = t_data.min(), t_data.max()
+Nt_sim = 301 # Keep the original number of simulation points for consistency
+t_grid = np.linspace(t0, tEnd, Nt_sim)
+
+# Update initial conditions (X0) based on the first observed data point
+# Assuming S is approximately N - I0 - R0, and R0 is 0 initially
+X0 = np.array([0.99 - I_obs[0], I_obs[0], 0.0, 0.9, 0.001]) # Adjusted S and I based on first observation
+
+# Recalculate true_traj with the new psi formulation and updated t_grid
+true_traj = integrate(f_mech_np, X0, t_grid, eta_true)
+I_true = true_traj[:,1]
+
+# Collocation points remains the same as t_grid
+t_col = t_grid.copy()
+
+# Torch tensors
+t_data_t = torch.tensor(t_data.reshape(-1,1), dtype=dtype, device=device)
+I_obs_t = torch.tensor(I_obs.reshape(-1,1), dtype=dtype, device=device)
+t_col_t = torch.tensor(t_col.reshape(-1,1), dtype=dtype, device=device)
+t_grid_t = torch.tensor(t_grid.reshape(-1,1), dtype=dtype, device=device)
+X0_t = torch.tensor(X0.reshape(1,-1), dtype=dtype, device=device)
+
+# ----------------------------
+# 4) Data fitting and estimated values (before PINN setup)
+# This section simulates an ODE fitting process to the observed data.
+# The 'fitted' parameters are represented by `eta_pin`, and `X0` as initial conditions.
+# ----------------------------
+
+# Simulate ODE fit to observed data points (`t_data` and `I_obs`)
+# We use `eta_pin` as the 'fitted' parameters for the observed data.
+sol_ode_fit_observed = integrate(f_mech_np, X0, t_data, eta_pin)
+I_fit_ode_observed = sol_ode_fit_observed[:, 1] # Infected component
+
+# --- Confidence Interval Calculation (for simulated ODE fit) ---
+residuals_ode_fit = I_obs - I_fit_ode_observed
+std_residuals_ode_fit = np.std(residuals_ode_fit)
+
+# Degrees of freedom: number of data points - number of parameters estimated
+# Here, we treat eta_pin's parameters as the 'fitted' ones for this demonstration.
+dof_ode_fit = len(I_obs) - len(eta_pin) # len(eta_pin) now correctly reflects updated parameter count
+
+# Only calculate t_val if dof > 0. Using 95% confidence (alpha=0.05)
+if dof_ode_fit > 0:
+    # Using scipy.stats.t for more accurate t-value
+    t_val_ode_fit = t.ppf(0.975, dof_ode_fit)
+else:
+    t_val_ode_fit = 0 # No confidence interval if no degrees of freedom
+
+lower_bound_ode_fit = I_fit_ode_observed - t_val_ode_fit * std_residuals_ode_fit
+upper_bound_ode_fit = I_fit_ode_observed + t_val_ode_fit * std_residuals_ode_fit
+
+# --- Plotting the ODE fit to observed data ---
+plt.figure(figsize=(10, 4))
+plt.plot(t_data, I_obs, 'o', label='Observed Cases', markersize=4)
+plt.plot(t_data, I_fit_ode_observed, 'r-', label=' Model Fit', linewidth=2)
+plt.fill_between(t_data, lower_bound_ode_fit, upper_bound_ode_fit, color='green', alpha=0.2, label='95% Confidence Interval')
+plt.xlabel('Time (week)', fontweight='bold')
+plt.ylabel('Infected Population', fontweight='bold')
+plt.title('Fitted Dengue ODE Model to Brazilian Data', fontweight='bold')
+legend_ode = plt.legend(prop={'weight': 'bold'})
+legend_ode.set_frame_on(False)
+plt.tight_layout()
+plt.show()
+
+# --- Plotting another ODE fit to noisy observed data with caption ---
+plt.figure(figsize=(10, 5))
+plt.plot(t_data, I_obs, 'o', label='Observed Cases', markersize=4)
+plt.plot(t_data, I_fit_ode_observed, 'r-', label='ODE Model Fit', linewidth=2)
+plt.fill_between(t_data, lower_bound_ode_fit, upper_bound_ode_fit, color='green', alpha=0.2, label='95% Confidence Interval')
+plt.xlabel('Time (week)', fontweight='bold')
+plt.ylabel('Infected Population', fontweight='bold')
+plt.title('Detailed ODE Model Fit Noisy Observed Cases', fontweight='bold')
+legend_ode_fit_new = plt.legend(prop={'weight': 'bold'})
+legend_ode_fit_new.set_frame_on(False)
+plt.tight_layout()
+
+plt.subplots_adjust(bottom=0.2)
+plt.figtext(0.5, 0.01, "Figure: This plot illustrates the ODE model fitted to noisy observed cases, including a 95% confidence interval.", ha="center", fontsize=10, wrap=True) # Re-adding the caption
+plt.show()
+
+# --- Print Initial Conditions and Fitted Parameters (for simulated ODE fit) ---
+print("\nEstimated Initial Conditions (from ODE fit to observed data):")
+labels = ['S', 'I', 'R', 'Sv', 'Iv'] # Labels for X0 components
+for i, val in enumerate(X0):
+    print(f"{labels[i]:10s}: {val:.4f}")
+
+print("\nFitted Parameters Used (from ODE fit to observed data):")
+for name, val in eta_pin.items():
+    print(f"{name:10s}: {val}")
+
+print("\n--- PINN Setup using observed data and derived ICs ---")
